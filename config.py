@@ -25,7 +25,7 @@ OLLAMA_OPTIONS: dict = {
     "temperature": 0,
     "seed": 0,  # fixed seed => same document gives the same decision every run
     "num_ctx": 4096,  # fits model + KV cache in 4 GB VRAM (stays on GPU)
-    "num_predict": 4096,  # output budget: the reply must list every fragment id
+    "num_predict": 1024,  # detect batches are small; 1024 bounds each generate
 }
 
 # --- Tesseract ---------------------------------------------------------------

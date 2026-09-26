@@ -1,9 +1,9 @@
-"""Ollama-backed Classify+Detect step: one structured-JSON call per document.
+"""Ollama-backed LLM layers (Plan v2): Classify, Detect, and Audit.
 
-Uses the exact prompt contract from the PRD (section 5), called directly via
-the Ollama REST API (no framework wrapper). Parsing is pydantic-validated;
-one retry on failure; unparseable after retry -> OllamaParseError so the
-pipeline can fail closed.
+Each layer makes its own **fresh** `/api/generate` request — no chat session is
+reused, so the audit in particular never sees the reasoning of the layers before
+it. Parsing is validated per layer; one retry on failure; after a retry the layer
+raises `OllamaParseError` so the pipeline can fail closed.
 """
 from __future__ import annotations
 
@@ -24,9 +24,6 @@ from config import (
 )
 from ocr import OcrWord, group_lines
 
-# Metrics of the most recent classify_and_detect calls (debug/demo aid).
-LAST_CALL_METRICS: list[dict] = []
-
 
 DocumentType = Literal[
     "bank_statement", "pan_card", "salary_slip", "marksheet",
@@ -41,6 +38,16 @@ class OllamaError(RuntimeError):
 class OllamaParseError(ValueError):
     """Model output unparseable after retry -> pipeline must fail closed."""
 
+
+FIELD_TYPES: tuple[str, ...] = (
+    "name", "father_name", "address", "phone_number", "email",
+    "date_of_birth", "account_number", "ifsc_code", "aadhaar_number",
+    "pan_number", "voter_id_number", "salary_amount", "other_amount",
+    "employer_name", "designation", "pf_number", "institution_name",
+    "qualification", "cgpa_or_marks", "roll_number", "category",
+    "transaction_line", "signature_marker", "photo_marker",
+    "label_text", "remarks", "other",
+)
 
 class LLMDecision(BaseModel):
     """Validated structured decision from the model."""
@@ -79,36 +86,6 @@ class LLMDecision(BaseModel):
 _SHORT_ALPHABET = "abcdefghijklmnopqrstuvwxyz"
 
 
-_STOP_WORDS = frozenset({
-    "a", "an", "the", "of", "to", "is", "in", "on", "at", "by", "for",
-    "with", "from", "and", "or", "but", "per", "this", "these", "those",
-    "period", "statement", "said", "will", "was", "are", "were",
-})
-
-_ONLY_SYMBOLS_RE = re.compile(r"^[^A-Za-z0-9]+$")
-
-
-def filter_fragments(words: list["OcrWord"]) -> list["OcrWord"]:
-    """Drop uninformative fragments before sending to the LLM.
-
-    Stop words, punctuation-only tokens, and lone symbols carry no
-    redaction-relevant signal. Fewer fragments => the LLM is more likely
-    to list *every* ID in its response. Dropped words are handled by the
-    fail-closed path in apply_validator (they simply end up redacted).
-    """
-    kept = []
-    for w in words:
-        text = w.text.strip()
-        if not text:
-            continue
-        if _ONLY_SYMBOLS_RE.match(text):
-            continue
-        if text.lower() in _STOP_WORDS:
-            continue
-        kept.append(w)
-    return kept
-
-
 def build_id_maps(ocr_words: list["OcrWord"]) -> tuple[dict[str, str], dict[str, str]]:
     """Return (full->short, short->full) id maps, 1:1 and order-stable."""
     forward: dict[str, str] = {}
@@ -120,57 +97,247 @@ def build_id_maps(ocr_words: list["OcrWord"]) -> tuple[dict[str, str], dict[str,
     return forward, backward
 
 
-SYSTEM_PROMPT = """You are a document redaction assistant. You will receive a list of text
-fragments extracted from a document via OCR, each with a unique short ID
-(like "a07"). Your job:
-
-1. Classify the document type: one of ["bank_statement", "pan_card", "salary_slip",
-   "marksheet", "aadhaar_card", "voter_id", "other"], using these decisive
-   markers in order:
-   - an IFSC code, a "Balance" column, or "Statement of Account" => bank_statement
-     (transaction rows reading "SALARY CREDIT" do NOT make it a salary_slip)
-   - "Permanent Account Number" or "Income Tax Department" => pan_card
-   - "UIDAI" or "Aadhaar", or a 12-digit number in 4-4-4 groups => aadhaar_card
-   - an earnings vs deductions breakdown with gross/net pay => salary_slip
-   - subject names with marks or grades => marksheet
-   - none of the above => other
-2. For the given SHARING PURPOSE, decide which fragment IDs must be KEPT
-   (visible). Everything you do NOT keep is hidden automatically, so name
-   only the fragments to keep.
-3. Match each OCR fragment to the closest field category by its content and
-   context (e.g. a 10-digit number near the word "Account" is account_number;
-   a 12-digit number in groups of 4 is likely aadhaar_number). Labels like
-   "Name:" or "Amount" on their own are usually safe to KEEP — redact the
-   sensitive values, not the labels.
-4. Be stingy: keep only what this purpose genuinely requires. Omit anything
-   uncertain — an omitted fragment is hidden, so a wrong omission is harmless
-   while a wrong keep leaks data.
-
-Respond ONLY with valid JSON in this exact schema:
-{"document_type": "...", "keep_ids": ["a03","a04"], "reasoning": "<=15 words"}
-
-keep_ids must list EVERY fragment you want to remain visible. Do not list the
-ids you want hidden, and do not invent ids that were not in the prompt.
-
-The document is the OCR text only; the id lists contain only ids."""
+# Per-layer call log (Plan v2): which layer ran, how long it took.
+# Defined before _call_generate so nothing dangles on import order.
+LAST_LAYER_CALLS: list[dict] = []
 
 
-def build_prompt(ocr_words: list[OcrWord], preset: dict) -> tuple[str, str, dict[str, str]]:
-    """Return (system, user, short->full id map).
+def _call_generate(system: str, user: str) -> str:
+    payload = {
+        "model": OLLAMA_MODEL,
+        "system": system,
+        "prompt": user,
+        "format": "json",
+        "stream": False,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+        "options": OLLAMA_OPTIONS,
+    }
+    t0 = time.perf_counter()
+    try:
+        resp = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=OLLAMA_TIMEOUT_S
+        )
+    except requests.RequestException as exc:
+        raise OllamaError(f"Ollama request failed: {exc}") from exc
+    elapsed = time.perf_counter() - t0
+    if resp.status_code != 200:
+        raise OllamaError(f"Ollama HTTP {resp.status_code}: {resp.text[:200]}")
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise OllamaError(f"Unexpected Ollama response: {resp.text[:200]}") from exc
+    LAST_LAYER_CALLS.append({
+        "system_preview": system[:80], "total_s": round(elapsed, 2),
+    })
+    return data.get("response", "")
 
-    Fragments are rendered one per line as "short_id: text" — fragment format
-    benchmarked best on decision quality; short ids cut output tokens ~4x.
+
+def _classify_texts(texts: list[str]) -> str:
+    """Layer 1: document_type only, no ids, no purpose.
+
+    Input is the OCR text as reading-order visual lines (not loose words): a
+    small model needs the layout hints ("ACCOUNT NO" next to its value) more
+    than it needs every stray token.
     """
+    system = (
+        "You classify a document from its OCR text. Reply with ONLY the type "
+        "name. Types and their tell-tale words: bank_statement (account number, "
+        "IFSC, branch, statement period, balance), pan_card (permanent account "
+        "number, father's name, income tax), salary_slip (basic, HRA, gross, "
+        "net pay, deductions, employee code), marksheet (semester, grade, CGPA, "
+        "roll number, university), aadhaar_card (aadhaar, UIDAI, VID), voter_id "
+        "(elector, EPIC, constituency), other (none of these)."
+    )
+    user = (
+        "OCR text, reading order, one visual line per row:\n"
+        + "\n".join(texts)
+        + "\n\nDocument type:"
+    )
+    raw = _call_generate(system, user)
+    cleaned = raw.strip().strip('"').strip("'").lower()
+    for candidate in (
+        "bank_statement", "pan_card", "salary_slip", "marksheet",
+        "aadhaar_card", "voter_id", "other",
+    ):
+        if candidate in cleaned:
+            return candidate
+    return "other"
+
+
+def _parse_labels(raw: str, backward: dict[str, str]) -> list[dict]:
+    """Parse Layer-2 labels output into [{"id": full id, "type": field type}]."""
+    data = json.loads(raw.strip().strip("`").strip())
+    if isinstance(data, dict) and isinstance(data.get("labels"), list):
+        items = data["labels"]
+    elif isinstance(data, list):
+        items = data
+    else:
+        raise ValueError("expected {labels: [...]} object")
+    vocab = set(FIELD_TYPES)
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        short = str(item.get("id", "")).strip().lower()
+        ftype = str(item.get("type", "")).strip().lower()
+        if ftype not in vocab:
+            ftype = "other"
+        full = backward.get(short)
+        if not full or full in seen:
+            continue
+        seen.add(full)
+        out.append({"id": full, "type": ftype})
+    return out
+
+
+def _parse_flags(raw: str, backward: dict[str, str] | None = None) -> list[str]:
+    """Parse Layer-5 audit output into a list of full OCR ids."""
+    data = json.loads(raw.strip().strip("`").strip())
+    if isinstance(data, dict) and isinstance(data.get("flagged_ids"), list):
+        items = data["flagged_ids"]
+    elif isinstance(data, list):
+        items = data
+    else:
+        raise ValueError("expected {flagged_ids: [...]} object")
+    out: list[str] = []
+    for item in items:
+        token = str(item).strip().lower()
+        full = backward.get(token, token) if backward else token
+        if full and full not in out:
+            out.append(full)
+    return out
+
+
+DETECT_VOCABULARY = ", ".join(FIELD_TYPES)
+
+DETECT_SYSTEM = (
+    "You label OCR text fragments with exactly one field type each. "
+    "Valid types: " + DETECT_VOCABULARY + ". "
+    "Rules: 'label_text' marks a field LABEL itself ('Name:', captions) — "
+    "NOT the value after it. 'salary_amount' is ONLY the salary/income figure "
+    "(a value on a line mentioning SALARY, gross pay, net pay or basic); every "
+    "other money value — rent, purchases, balances, totals — is 'other_amount'. "
+    "Every fragment gets exactly one label. "
+    "If genuinely uncertain between a sensitive type and 'other', choose "
+    "the sensitive type. Do NOT decide visibility — only identify what "
+    "each fragment IS."
+)
+
+
+def detect(ocr_words: "list[OcrWord]") -> list[dict]:
+    """Plan v2, Layer 2: purpose-agnostic field labels, one fresh call."""
     forward, backward = build_id_maps(ocr_words)
     fragments = "\n".join(f"{forward[w.id]}: {w.text}" for w in ocr_words)
     user = (
-        f"Sharing purpose: {preset['label']}\n"
-        f"Fields to KEEP for this purpose: {preset['keep']}\n"
-        f"Fields to REDACT for this purpose: {preset['redact']}\n\n"
-        f"OCR fragments:\n{fragments}\n\n"
-        "Classify the document and decide redact_ids/keep_ids now."
+        "Fragments:\n" + fragments + "\n\n"
+        "Respond ONLY as JSON, one entry per fragment id, no explanation: "
+        '{"labels": [{"id": "a00", "type": "name"}, ...]}'
     )
-    return SYSTEM_PROMPT, user, backward
+    for attempt in range(2):
+        try:
+            out = _parse_labels(_call_generate(DETECT_SYSTEM, user), backward)
+        except (ValueError, json.JSONDecodeError, OllamaError) as exc:
+            last_error = exc
+            continue
+        if not out:
+            last_error = ValueError("No labeled ids parsed from response")
+            continue
+        return out
+    raise OllamaParseError(f"Detect output unparseable after retry: {last_error}")
+
+
+# Ids whose Detect batch never produced usable JSON: the pipeline fails them
+# closed (redacted) and says so in the UI, instead of losing the whole document.
+LAST_DETECT_FAILED_IDS: list[str] = []
+
+
+def _detect_batch(batch: "list[OcrWord]", depth: int = 0) -> list[dict]:
+    """Detect one batch; on unparseable output, split it and retry the halves.
+
+    A 3B model occasionally runs long and returns truncated JSON. Halving
+    isolates the offending fragment(s) instead of discarding a whole document;
+    batches of <= 5 fragments that still fail are recorded as failed ids.
+    """
+    try:
+        return detect(batch)
+    except OllamaParseError:
+        if len(batch) <= 5 or depth >= 3:
+            LAST_DETECT_FAILED_IDS.extend(w.id for w in batch)
+            return []
+        mid = len(batch) // 2
+        return _detect_batch(batch[:mid], depth + 1) + _detect_batch(batch[mid:], depth + 1)
+
+
+def detect_batched(ocr_words: "list[OcrWord]", batch_size: int = 25) -> list[dict]:
+    """Shard a long fragment list into deterministic id-exact batches.
+
+    Sharding is by position in the (reading-order) fragment list, so the same
+    document always produces the same batches. A batch that cannot be parsed is
+    split (see `_detect_batch`) rather than failing the whole run.
+    """
+    LAST_DETECT_FAILED_IDS.clear()
+    out: list[dict] = []
+    for start in range(0, max(1, len(ocr_words)), batch_size):
+        out.extend(_detect_batch(ocr_words[start:start + batch_size]))
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for entry in out:
+        if entry["id"] in seen:
+            continue
+        seen.add(entry["id"])
+        unique.append(entry)
+    return unique
+
+
+def classify(ocr_words: "list[OcrWord]") -> str:
+    """Plan v2, Layer 1: document_type only, no ids, no purpose info."""
+    lines = [
+        " ".join(w.text for w in line) for line in group_lines(ocr_words)
+    ]
+    return _classify_texts(lines[:60])
+
+
+AUDIT_SYSTEM = (
+    "You audit a redaction result. You have NO knowledge of how these "
+    "decisions were made. You see only fragments currently kept visible plus "
+    "the sharing purpose. Flag an id ONLY if its text is itself sensitive "
+    "(a personal identifier, account or card number, address, phone, email, "
+    "date of birth, signature, or a family member's name/number). Plain "
+    "labels ('Name:', 'Employer:'), generic words, amounts, dates that are "
+    "not a date of birth, and employer or institution names are NOT "
+    "sensitive — never flag those. When nothing is sensitive, return "
+    "flagged_ids as an empty list."
+)
+
+
+def validate_llm(
+    ocr_words: "list[OcrWord]",
+    keep_ids: list[str],
+    purpose_label: str,
+) -> tuple[list[str], str]:
+    """Plan v2, Layer 5b: fresh-context audit of visible fragments only."""
+    by_id = {w.id: w for w in ocr_words}
+    fragments = "\n".join(
+        f"{w.id}: {w.text}" for w in ocr_words if w.id in set(keep_ids)
+    )
+    user = (
+        f"Sharing purpose: {purpose_label}\n"
+        f"Fragments currently kept visible:\n{fragments}\n\n"
+        "Respond ONLY as JSON: "
+        '{"flagged_ids": ["w0001"], "reasoning": "one sentence"}'
+    )
+    for attempt in range(2):
+        try:
+            raw = _call_generate(AUDIT_SYSTEM, user)
+            flagged = _parse_flags(raw)
+            data = json.loads(raw.strip().strip("`").strip())
+            reasoning = str(data.get("reasoning", "")).strip() if isinstance(data, dict) else ""
+            valid = {w.id for w in ocr_words}
+            return [i for i in flagged if i in valid], reasoning
+        except (ValueError, json.JSONDecodeError, KeyError, OllamaError) as exc:
+            last_error = exc
+    raise OllamaParseError(f"Audit output unparseable after retry: {last_error}")
 
 
 def check_ollama() -> tuple[bool, str]:
@@ -189,52 +356,9 @@ def check_ollama() -> tuple[bool, str]:
     )
 
 
-def _call_ollama(system: str, user: str) -> tuple[str, dict]:
-    payload = {
-        "model": OLLAMA_MODEL,
-        "system": system,
-        "prompt": user,
-        "format": "json",
-        "stream": False,
-        "keep_alive": OLLAMA_KEEP_ALIVE,
-        "options": OLLAMA_OPTIONS,
-    }
-    try:
-        resp = requests.post(
-            f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=OLLAMA_TIMEOUT_S
-        )
-    except requests.RequestException as exc:
-        raise OllamaError(f"Ollama request failed: {exc}") from exc
-    if resp.status_code != 200:
-        raise OllamaError(f"Ollama HTTP {resp.status_code}: {resp.text[:200]}")
-    try:
-        data = resp.json()
-        return data["response"], data
-    except (ValueError, KeyError) as exc:
-        raise OllamaError(f"Unexpected Ollama response: {resp.text[:200]}") from exc
-
-
-_FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*|\s*```$")
-
-
-def _parse_decision(raw: str) -> LLMDecision:
-    """Parse model output; tolerate optional markdown fences."""
-    text = _FENCE_RE.sub("", raw.strip()).strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid JSON: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ValueError("expected a JSON object")
-    try:
-        return LLMDecision.model_validate(data)
-    except ValidationError as exc:
-        raise ValueError(f"schema mismatch: {exc}") from exc
-
-
 def _warmup_call() -> bool:
     try:
-        _call_ollama(system="Reply with JSON only.", user='{"ready": true}')
+        _call_generate(system="Reply with JSON only.", user='{"ready": true}')
         return True
     except OllamaError:
         return False
@@ -245,70 +369,13 @@ def warmup() -> bool:
     return _warmup_call()
 
 
-def classify_and_detect(
-    ocr_words: list[OcrWord], purpose_key: str, preset: dict
-) -> LLMDecision:
-    """One structured call (+1 retry) -> validated decision with full ids."""
-    filtered = filter_fragments(ocr_words)
-    system, user, short_to_full = build_prompt(filtered, preset)
-    last_error: Exception | None = None
-    decision: LLMDecision | None = None
-    for attempt in range(2):
-        prompt = user
-        if attempt == 1:
-            prompt = (
-                f"{user}\n\nYour previous reply was not valid for this schema "
-                f"({last_error}). Reply with ONLY the JSON object."
-            )
-        t0 = time.perf_counter()
-        raw, meta = _call_ollama(system, prompt)
-        LAST_CALL_METRICS.append({
-            "purpose": purpose_key,
-            "attempt": attempt + 1,
-            "model": meta.get("model", OLLAMA_MODEL),
-            "total_s": round(time.perf_counter() - t0, 2),
-            "load_s": round(meta.get("load_duration", 0) / 1e9, 2),
-            "prompt_eval_s": round(meta.get("prompt_eval_duration", 0) / 1e9, 2),
-            "eval_s": round(meta.get("eval_duration", 0) / 1e9, 2),
-            "prompt_tokens": meta.get("prompt_eval_count", 0),
-            "output_tokens": meta.get("eval_count", 0),
-            "raw_response": raw,
-        })
-        try:
-            decision = _parse_decision(raw)
-            break
-        except ValueError as exc:
-            last_error = exc
-    if decision is None:
-        raise OllamaParseError(f"LLM output unparseable after retry: {last_error}")
-
-    # Map short ids back to full OCR ids; keep only known ids.
-    valid = {w.id for w in ocr_words}
-    unmapped_keep = [i for i in decision.keep_ids if i not in short_to_full]
-    unmapped_redact = [i for i in decision.redact_ids if i not in short_to_full]
-    decision.redact_ids = [
-        short_to_full[i] for i in decision.redact_ids if i in short_to_full
-    ]
-    decision.keep_ids = [
-        short_to_full[i] for i in decision.keep_ids if i in short_to_full
-    ]
-    decision.redact_ids = [i for i in decision.redact_ids if i in valid]
-    decision.keep_ids = [i for i in decision.keep_ids if i in valid]
-    # Ids the model invented (not in the prompt) — visible in metrics for debug.
-    LAST_CALL_METRICS[-1]["unmapped_keep"] = unmapped_keep
-    LAST_CALL_METRICS[-1]["unmapped_redact"] = unmapped_redact
-    return decision
-
-
 if __name__ == "__main__":
-    import time
-
-    from ocr import OcrWord
-
+    # Layered smoke test: one real call per layer, plus timings.
     ok, msg = check_ollama()
     print(("OK: " if ok else "FAIL: ") + msg)
     if not ok:
         raise SystemExit(1)
+    print("  warmup:", warmup())
 
     demo = [
         OcrWord("w0001", "Account", 10, 10, 50, 20, 95),
@@ -320,14 +387,28 @@ if __name__ == "__main__":
     ]
     preset = {
         "label": "Proof of Income",
-        "keep": ["name", "salary_amount", "employer_name"],
-        "redact": ["account_number", "address", "phone_number"],
+        "keep_types": ["name", "salary_amount", "employer_name", "label_text"],
+        "redact_types": ["account_number", "address", "phone_number"],
     }
+
     t0 = time.perf_counter()
-    result = classify_and_detect(demo, "proof_of_income", preset)
-    print(f"in {time.perf_counter() - t0:.1f}s ->")
-    print("  metrics:", LAST_CALL_METRICS[-1])
-    print("  type:", result.document_type)
-    print("  redact:", result.redact_ids)
-    print("  keep:", result.keep_ids)
-    print("  reasoning:", result.reasoning)
+    print("  Layer 1 classify:", classify(demo), f"({time.perf_counter() - t0:.1f}s)")
+
+    t0 = time.perf_counter()
+    labels = detect_batched(demo)
+    print(f"  Layer 2 detect: {labels} ({time.perf_counter() - t0:.1f}s)")
+
+    from policy import apply_policy
+
+    split = apply_policy(labels, preset)
+    print("  Layer 3 policy: redact", split["redact_ids"], "keep", split["keep_ids"])
+
+    t0 = time.perf_counter()
+    visible = [w for w in demo if w.id in set(split["keep_ids"])]
+    print(
+        "  Layer 5b audit:",
+        validate_llm(visible, [w.id for w in visible], preset["label"]),
+        f"({time.perf_counter() - t0:.1f}s)",
+    )
+    for call in LAST_LAYER_CALLS:
+        print(f"    {call['total_s']:6.2f}s  {call['system_preview'][:40]}")

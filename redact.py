@@ -65,9 +65,12 @@ def load_presets(path: Path | None = None) -> dict:
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"presets.json is not valid JSON: {exc}") from exc
     for key, preset in data.items():
-        for field_name in ("label", "keep", "redact"):
-            if field_name not in preset:
-                raise RuntimeError(f"preset '{key}' missing '{field_name}'")
+        if "label" not in preset:
+            raise RuntimeError(f"preset '{key}' missing 'label'")
+        if not ({"keep", "redact"} <= set(preset) or {"keep_types", "redact_types"} <= set(preset)):
+            raise RuntimeError(
+                f"preset '{key}' needs keep/redact or keep_types/redact_types"
+            )
     return data
 
 
@@ -215,14 +218,100 @@ def pii_word_ids(words: list[OcrWord]) -> set[str]:
     return ids
 
 
-# Anchors for the deterministic repair. These are the values the stated purpose
-# exists to reveal; the LLM tends to blanket-redact them.
-_SALARY_ANCHORS = ("SALARY CREDIT", "GROSS SALARY", "NET SALARY", "BASIC")
+# Anchors for the deterministic repair and for amount anchoring. These are the
+# values the stated purpose exists to reveal; the LLM tends to blanket-redact
+# them, or (worse) to call every money value a salary.
+_SALARY_ANCHORS = (
+    "SALARY CREDIT", "SALARY", "GROSS", "NET PAY", "NET SALARY", "BASIC",
+    "EARNINGS", "CTC",
+)
 _NAME_ANCHORS = ("ACCOUNT HOLDER", "EMPLOYEE NAME", "CUSTOMER NAME", "ACCOUNT NAME")
 # A line naming a third party is skipped entirely: their name must stay hidden.
 _NAME_ANCHOR_EXCLUDE = ("FATHER", "MOTHER", "SPOUSE", "GUARDIAN", "NOMINEE")
 _AMOUNT_RE = re.compile(r"[₹$]?[\d,]+(\.\d+)?$")
 _NAME_WORD_RE = re.compile(r"^[A-Za-z][A-Za-z.'-]*$")
+# Ledger-row evidence for the name rule: a money value plus a date or a transfer
+# keyword. The name value of a card/ID often sits on its own line (a PAN card
+# prints "Name" and "ARJUN MEHTA" on separate rows), so the row's *content* —
+# not the presence of a label word — decides what the name is.
+_MONEY_RE = re.compile(r"^[₹$]?\d[\d,]*(\.\d{1,2})?$")
+_DATE_RE = re.compile(r"^\d{1,2}[-/][A-Za-z0-9]{1,3}[-/]\d{2,4}$")
+_TXN_ROW_HINTS = (
+    "PURCHASE", "PAYMENT", "UPI/", "NEFT/", "IMPS/", "ATM/", "DEBIT", "CREDIT",
+    "TXN", "WITHDRAWAL", "DEPOSIT",
+)
+
+
+def anchor_amount_labels(
+    ocr_words: list[OcrWord], labels: list[dict]
+) -> tuple[list[dict], list[str]]:
+    """Deterministic refinement between Layer 2 and Layer 3: anchor amounts.
+
+    A small model reliably tags *every* money value on a statement as
+    `salary_amount` (rent, card purchases, the closing balance). `salary_amount`
+    is a KEEP type under "Proof of Income", so an unanchored mislabel would
+    expose the whole spending pattern — exactly what the purpose must not show.
+
+    An amount is accepted as `salary_amount` only when its own visual line
+    carries a salary anchor ("SALARY CREDIT", "GROSS SALARY", …). Anything else
+    is demoted to `other_amount`, which every preset redacts. Same anchor list
+    the deterministic repair uses, so the label layer and the repair layer
+    cannot disagree about which lines are salary lines.
+
+    Returns (relabelled labels, demoted ids).
+    """
+    anchored: set[str] = set()
+    for line in group_lines(ocr_words):
+        text = " ".join(w.text for w in line).upper()
+        if any(anchor in text for anchor in _SALARY_ANCHORS):
+            anchored.update(w.id for w in line)
+    demoted: list[str] = []
+    out: list[dict] = []
+    for entry in labels:
+        if entry.get("type") == "salary_amount" and entry.get("id") not in anchored:
+            demoted.append(entry["id"])
+            out.append({**entry, "type": "other_amount"})
+        else:
+            out.append(entry)
+    return out, sorted(set(demoted))
+
+
+def anchor_name_labels(
+    ocr_words: list[OcrWord], labels: list[dict]
+) -> tuple[list[dict], list[str]]:
+    """Deterministic refinement between Layer 2 and Layer 3: anchor names.
+
+    The same model also calls **merchants** `name` ("Card Purchase BIGBASKET"),
+    and `name` is a KEEP type for Proof of Income / Proof of Address / ID
+    Verification — so an unanchored mislabel exposes where the account holder
+    shops, which the purpose does not require.
+
+    The discriminator is the row itself, never the presence of a label word: a
+    `name` on a ledger row (a money value **and** either a date or a transfer
+    keyword such as PURCHASE, NEFT/ or UPI/) is a counterparty, so it is demoted to
+    `other` and every preset redacts it. A name on its own line — including a
+    PAN card, whose "Name" label and value are printed on separate rows — keeps
+    its `name` label and its purpose-critical protection.
+
+    Returns (relabelled labels, demoted ids).
+    """
+    rows: set[str] = set()
+    for line in group_lines(ocr_words):
+        text = " ".join(w.text for w in line).upper()
+        money = any(_MONEY_RE.match(w.text.strip()) for w in line)
+        dated = any(_DATE_RE.match(w.text.strip()) for w in line)
+        hinted = any(hint in text for hint in _TXN_ROW_HINTS)
+        if money and (dated or hinted):
+            rows.update(w.id for w in line)
+    demoted: list[str] = []
+    out: list[dict] = []
+    for entry in labels:
+        if entry.get("type") == "name" and entry.get("id") in rows:
+            demoted.append(entry["id"])
+            out.append({**entry, "type": "other"})
+        else:
+            out.append(entry)
+    return out, sorted(set(demoted))
 
 
 def repair_anchored_keeps(
@@ -289,12 +378,50 @@ def render_redaction(
     return out
 
 
-def run_pipeline(
-    img: Image.Image, purpose_key: str, preset: dict
+def _fail_closed_decision(words: list[OcrWord], note: str) -> LLMDecision:
+    return LLMDecision(
+        document_type="other",
+        redact_ids=[w.id for w in words],
+        keep_ids=[],
+        reasoning=note,
+    )
+
+
+def audit_guardrail(
+    flagged_ids: list[str],
+    visible_ids: list[str],
+    protected_ids: set[str],
+) -> tuple[list[str], list[str]]:
+    """Split an audit's flags into (actionable, blocked) — Plan v2 Layer 5b.
+
+    The deterministic policy wins over the audit for `purpose_critical_types`:
+    those are the fragments the stated purpose exists to reveal, so a fresh-
+    context LLM must not be able to hide them again (an earlier build let the
+    audit re-redact the holder's own name). Flags on fragments that are not
+    currently visible are dropped as hallucinated ids.
+    """
+    visible = set(visible_ids)
+    actionable: list[str] = []
+    blocked: list[str] = []
+    for fid in dict.fromkeys(flagged_ids):
+        if fid not in visible:
+            continue
+        (blocked if fid in protected_ids else actionable).append(fid)
+    return actionable, blocked
+
+
+def run_plan_v2(
+    img: Image.Image, purpose_key: str, preset: dict, max_audit_rounds: int = 2
 ) -> PipelineResult:
-    """Full local pipeline: normalize -> OCR -> LLM -> validator -> render."""
+    """Plan v2 pipeline: OCR -> classify -> detect -> policy -> regex net ->
+    LLM audit (<=max_audit_rounds rounds) -> repairs -> render. Any LLM step
+    raising OllamaError/OllamaParseError is skipped and the pipeline keeps
+    going with fail-closed redaction for that step."""
+    from policy import apply_policy
+
     warnings: list[str] = []
     t0 = time.perf_counter()
+    audit_rounds = 0
 
     norm = normalize_image(img.convert("RGB"))
     words = extract_words(norm.image)
@@ -303,27 +430,52 @@ def run_pipeline(
             "No text detected in the image. Try a sharper, well-lit photo."
         )
 
+    # Layer 1: fresh classify call.
     try:
-        decision = llm.classify_and_detect(words, purpose_key, preset)
-    except OllamaParseError as exc:
-        warnings.append(f"LLM output unparseable ({exc}); failing closed: "
-                        "everything redacted.")
-        decision = LLMDecision(
-            document_type="other",
-            redact_ids=[w.id for w in words],
-            keep_ids=[],
-            reasoning="fail-closed fallback",
-        )
-    except OllamaError as exc:
-        warnings.append(f"Ollama unavailable ({exc}); failing closed: "
-                        "everything redacted.")
-        decision = LLMDecision(
-            document_type="other",
-            redact_ids=[w.id for w in words],
-            keep_ids=[],
-            reasoning="fail-closed fallback",
-        )
+        document_type = llm.classify(words)
+    except (OllamaError, OllamaParseError) as exc:
+        warnings.append(f"Classify step skipped ({exc}); type unknown.")
+        document_type = "other"
 
+    # Layer 2: fresh, purpose-agnostic detect call (batched: short ids stay
+    # exact, each batch fits comfortably inside the model's JSON budget).
+    try:
+        labels = llm.detect_batched(words)
+        if llm.LAST_DETECT_FAILED_IDS:
+            warnings.append(
+                f"{len(llm.LAST_DETECT_FAILED_IDS)} fragment(s) had unparseable "
+                "label output; fail-closed to REDACT."
+            )
+        labels, unanchored_amounts = anchor_amount_labels(words, labels)
+        if unanchored_amounts:
+            warnings.append(
+                f"{len(unanchored_amounts)} money value(s) without a salary "
+                "anchor were demoted to other_amount (deterministic rule)."
+            )
+        labels, counterparties = anchor_name_labels(words, labels)
+        if counterparties:
+            warnings.append(
+                f"{len(counterparties)} ledger-row name(s) were treated as "
+                "counterparties and redacted (deterministic rule)."
+            )
+        labeled_ids = {entry["id"] for entry in labels}
+        unlabeled = sorted({w.id for w in words} - labeled_ids)
+    except (OllamaError, OllamaParseError) as exc:
+        warnings.append(f"Detect step failed ({exc}); failing closed: everything redacted.")
+        labels, unlabeled = [], [w.id for w in words]
+
+    # Layer 3: deterministic policy lookup.
+    split = apply_policy(labels, preset)
+    llm_redact_ids = sorted(set(split["redact_ids"]) | set(unlabeled))
+    keep_ids = [i for i in split["keep_ids"] if i not in set(unlabeled)]
+
+    # Layer 5a: regex net over the kept fragments.
+    decision = LLMDecision(
+        document_type=document_type,
+        redact_ids=llm_redact_ids,
+        keep_ids=keep_ids,
+        reasoning="plan-v2 layered pipeline",
+    )
     corrected, hits, unfilled = apply_validator(words, decision)
     if unfilled:
         warnings.append(
@@ -331,6 +483,53 @@ def run_pipeline(
             "fail-closed to REDACT."
         )
     validator_redact = sorted({h.word_id for h in hits} - set(decision.redact_ids))
+
+    # Layer 5b: fresh-context LLM audit — sees ONLY the visible fragments.
+    # Guardrail: the deterministic policy stays authoritative for
+    # `purpose_critical_types` (the fields the purpose exists to reveal), so the
+    # audit can tighten the leftovers but can never re-hide the holder's name or
+    # the salary figure it was asked to prove.
+    audit_hits: list[ValidationHit] = []
+    blocked_flags: list[str] = []
+    audit_calls = 0
+    protected_types = set(preset.get("purpose_critical_types", []))
+    protected_ids = {
+        entry["id"]
+        for entry in labels
+        if entry.get("type") in protected_types and entry["id"] in set(corrected.keep_ids)
+    }
+    for _ in range(max_audit_rounds):
+        visible = [w for w in words if w.id in set(corrected.keep_ids)]
+        if not visible:
+            break
+        audit_calls += 1
+        try:
+            flagged, reasoning = llm.validate_llm(
+                visible, [w.id for w in visible], preset.get("label", purpose_key)
+            )
+        except (OllamaError, OllamaParseError) as exc:
+            warnings.append(f"LLM audit skipped ({exc}).")
+            break
+        fresh, blocked = audit_guardrail(flagged, [w.id for w in visible], protected_ids)
+        blocked_flags.extend(blocked)
+        if not fresh:
+            break
+        audit_rounds += 1
+        for fid in fresh:
+            audit_hits.append(
+                ValidationHit(word_id=fid, pattern="llm_audit", matched_text=reasoning[:80])
+            )
+        corrected.keep_ids = [i for i in corrected.keep_ids if i not in set(fresh)]
+        corrected.redact_ids = sorted(set(corrected.redact_ids) | set(fresh))
+    if audit_rounds:
+        warnings.append(f"LLM audit re-redacted {len(audit_hits)} fragment(s).")
+    if blocked_flags:
+        warnings.append(
+            f"Policy guardrail overrode {len(blocked_flags)} audit flag(s) on "
+            "purpose-critical field(s)."
+        )
+    hits = hits + audit_hits
+    warnings.append(f"LLM audit ran {audit_calls} round(s).")
 
     if purpose_key == "proof_of_income":
         corrected, repaired = repair_anchored_keeps(words, corrected, purpose_key)
@@ -340,6 +539,7 @@ def run_pipeline(
                 "visible (label-anchored rule)."
             )
 
+    # Plan v1 compatibility: app.py calls run_pipeline().
     output = render_redaction(norm.image, words, corrected.redact_ids)
     elapsed = time.perf_counter() - t0
 
@@ -371,8 +571,20 @@ def run_pipeline(
     )
 
 
+def run_pipeline(
+    img: Image.Image, purpose_key: str, preset: dict
+) -> PipelineResult:
+    """Plan v1 entry point — kept so app.py and existing callers work unchanged.
+
+    Delegates to run_plan_v2, which supersedes the single combined LLM call
+    with the layered pipeline (classify → detect → policy → regex net →
+    LLM audit → repairs → render).
+    """
+    return run_plan_v2(img, purpose_key, preset)
+
+
 if __name__ == "__main__":
-    # Metrics probe: print the breakdown of the last pipeline LLM call.
+    # Metrics probe: per-layer timings of the layered (v2) pipeline.
     import llm as _llm
     from ocr import extract_words, normalize_image
     from PIL import Image
@@ -381,5 +593,11 @@ if __name__ == "__main__":
 
     img = Image.open("sample_docs/bank_statement.png").convert("RGB")
     presets = load_presets()
-    run_pipeline(img, "proof_of_income", presets["proof_of_income"])
-    print("last call metrics:", _llm.LAST_CALL_METRICS[-1])
+    result = run_pipeline(img, "proof_of_income", presets["proof_of_income"])
+    for call in _llm.LAST_LAYER_CALLS:
+        layer = call["system_preview"][4:40].split("(")[0].strip()
+        print(f"{call['total_s']:6.2f}s  {layer}")
+    print(f"total {result.elapsed_s:.1f}s  type={result.document_type}  "
+          f"redacted={len(result.llm_redact_ids)}")
+    for warning in result.warnings:
+        print("  !", warning)

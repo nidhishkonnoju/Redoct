@@ -71,8 +71,9 @@ def render_results(before: Image.Image, result, preset_label: str) -> None:
     )
 
     st.caption(
-        f"Classified as **{result.document_type}** in {result.elapsed_s:.1f}s. "
-        f"LLM reasoning: {result.reasoning}"
+        f"Classified as **{result.document_type}** in {result.elapsed_s:.1f}s — "
+        "layered pipeline: classify → detect → label anchors → policy lookup → "
+        "regex net → fresh-context LLM audit."
     )
 
     if result.validator_hits:
