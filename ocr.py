@@ -44,6 +44,12 @@ class OcrWord:
     w: int
     h: int
     conf: float
+    # Tesseract's own grouping. Kept for diagnostics only: the row-level rules
+    # rebuild rows from geometry (see reconstruct_rows) because merged ledger
+    # columns make these numbers unreliable. Default 0 for synthetic words.
+    block_num: int = 0
+    par_num: int = 0
+    line_num: int = 0
 
 
 def configure_tesseract() -> str:
@@ -83,6 +89,65 @@ def normalize_image(img: Image.Image) -> NormalizedImage:
     return NormalizedImage(image=resized, scale=scale, upscaled=scale > 1.0)
 
 
+def reconstruct_rows(
+    words: list[OcrWord], y_tolerance_ratio: float = 0.6
+) -> list[list[OcrWord]]:
+    """Group fragments into logical rows from geometry alone (Plan v3).
+
+    Tesseract's own block/paragraph/line numbering merges or splits columns of a
+    ledger row unpredictably, and every row-level rule must not inherit that
+    mistake: a counterparty name whose date and amount landed in a different
+    OCR line is exactly how a leak slipped through earlier. Rows are rebuilt
+    from the bounding boxes instead — fragments in reading order top-to-bottom,
+    a fragment joining the current row when its vertical center sits within
+    `max(height) * y_tolerance_ratio` of the row's previous fragment. The ratio
+    is generous on purpose because a label and its value often differ in font
+    size on the same visual row.
+
+    Each row is returned sorted left-to-right, so `row_text()` reads in visual
+    order. Pure geometry: no OCR service, no font metrics.
+    """
+    if not words:
+        return []
+    ordered = sorted(words, key=lambda w: w.y + w.h / 2)
+    rows: list[list[OcrWord]] = []
+    current: list[OcrWord] = []
+    for frag in ordered:
+        if not current:
+            current = [frag]
+            continue
+        ref = current[-1]
+        tolerance = max(frag.h, ref.h) * y_tolerance_ratio
+        if abs(_center(frag) - _center(ref)) <= tolerance:
+            current.append(frag)
+        else:
+            rows.append(current)
+            current = [frag]
+    if current:
+        rows.append(current)
+    for row in rows:
+        row.sort(key=lambda w: w.x)
+    return rows
+
+
+def _center(word: OcrWord) -> float:
+    return word.y + word.h / 2
+
+
+def row_for_fragment(frag: OcrWord, rows: list[list[OcrWord]]) -> list[OcrWord]:
+    """Return the reconstructed row holding `frag` (matched by id), else []."""
+    for row in rows:
+        if any(w.id == frag.id for w in row):
+            return row
+    return []
+
+
+def row_text(row: list[OcrWord], upper: bool = False) -> str:
+    """Space-joined row text in visual order; `upper` for keyword matching."""
+    text = " ".join(w.text for w in row)
+    return text.upper() if upper else text
+
+
 def group_lines(words: list[OcrWord]) -> list[list[OcrWord]]:
     """Group words into reading-order lines by vertical center proximity."""
     if not words:
@@ -104,6 +169,14 @@ def group_lines(words: list[OcrWord]) -> list[list[OcrWord]]:
     for line in lines:
         line.sort(key=lambda w: w.x)
     return lines
+
+
+def _int_field(data: dict, key: str, index: int) -> int:
+    """Read a tesseract int column defensively (missing/short columns -> 0)."""
+    try:
+        return int(data[key][index])
+    except (KeyError, TypeError, ValueError, IndexError):
+        return 0
 
 
 def extract_words(img: Image.Image) -> list[OcrWord]:
@@ -131,6 +204,9 @@ def extract_words(img: Image.Image) -> list[OcrWord]:
                 w=int(data["width"][i]),
                 h=int(data["height"][i]),
                 conf=conf,
+                block_num=_int_field(data, "block_num", i),
+                par_num=_int_field(data, "par_num", i),
+                line_num=_int_field(data, "line_num", i),
             )
         )
     return words

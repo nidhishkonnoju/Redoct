@@ -140,11 +140,102 @@ def make_salary_slip(out: Path) -> Path:
     return out
 
 
+def make_voter_id_card(out: Path) -> Path:
+    """Elector's Photo Identity Card (EPIC) — a second ID layout.
+
+    Same data as the PAN card on purpose: the pipeline must reach the same
+    privacy verdict from a different arrangement of labels and values, and the
+    voter number (3 letters + 7 digits) exercises `id_verification`'s
+    `voter_id_number` partial spec, which no other sample doc reaches.
+    """
+    W, H = (1200, 780)
+    img = Image.new("RGB", (W, H), (240, 244, 235))
+    d = ImageDraw.Draw(img)
+    d.rectangle((10, 10, W - 10, H - 10), outline=(60, 60, 60), width=4)
+    _text(d, (40, 30), "ELECTION COMMISSION OF INDIA", FONT_BOLD, 30)
+    _text(d, (40, 80), "Elector's Photo Identity Card", FONT, 24)
+    d.line((40, 120, W - 40, 120), fill=(0, 0, 0), width=2)
+
+    d.rectangle((880, 150, 1140, 460), outline=(120, 120, 120), width=3)
+    _text(d, (1010, 300), "PHOTO", FONT, 26, fill=(150, 150, 150), anchor="mm")
+
+    _text(d, (40, 160), "Elector's Name", FONT, 22)
+    _text(d, (40, 195), "ARJUN MEHTA", FONT_BOLD, 36)
+    _text(d, (40, 270), "Elector's Photo Identity Card No.", FONT, 22)
+    _text(d, (40, 305), "ABC1234567", FONT_MONO, 38)
+    _text(d, (40, 380), "Father's Name", FONT, 22)
+    _text(d, (40, 415), "RAKESH MEHTA", FONT_BOLD, 32)
+    _text(d, (40, 490), "Sex", FONT, 22)
+    _text(d, (200, 490), "MALE", FONT, 26)
+    _text(d, (40, 540), "Date of Birth", FONT, 22)
+    _text(d, (40, 575), "14/08/1999", FONT_MONO, 34)
+    _text(d, (40, 650), "Address", FONT, 22)
+    _text(d, (40, 685), "Flat 12, MG Road, Bengaluru 560034", FONT, 26)
+    img.save(out)
+    return out
+
+
+def make_marksheet(out: Path) -> Path:
+    """Consolidated marksheet — the first document for `education_proof`.
+
+    Carries one value per education type (institution, qualification, CGPA) plus
+    the identifiers that must stay hidden (roll number, category, father's name,
+    DOB), so the preset's keep/redact split is actually exercised by a layout.
+    """
+    img = Image.new("RGB", A4, (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    _text(d, (80, 60), "UNIVERSITY OF BENGALURU", FONT_BOLD, 38)
+    _text(d, (80, 118), "Consolidated Statement of Marks", FONT, 30)
+    _text(d, (1100, 70), "Year of Passing: 2026", FONT, 24)
+    d.line((80, 175, 1574, 175), fill=(0, 0, 0), width=3)
+
+    _text(d, (80, 215), "Student Name: ARJUN MEHTA", FONT_BOLD, 30)
+    _text(d, (900, 215), "Roll Number: 2023CS1042", FONT_MONO, 28)
+    _text(d, (80, 265), "Father's Name: RAKESH MEHTA", FONT, 26)
+    _text(d, (900, 265), "Date of Birth: 14/08/1999", FONT_MONO, 26)
+    _text(d, (80, 315), "Programme: Bachelor of Engineering", FONT, 26)
+    _text(d, (900, 315), "Category: GENERAL", FONT, 26)
+
+    y = 400
+    _text(d, (80, y), "Subject", FONT_BOLD, 26)
+    _text(d, (800, y), "Credits", FONT_BOLD, 26)
+    _text(d, (1050, y), "Grade", FONT_BOLD, 26)
+    _text(d, (1300, y), "Marks", FONT_BOLD, 26)
+    d.line((80, y + 45, 1574, y + 45), fill=(0, 0, 0), width=2)
+    rows = [
+        ("Data Structures", "4", "A", "88"),
+        ("Operating Systems", "4", "A", "85"),
+        ("Database Systems", "3", "A+", "91"),
+        ("Computer Networks", "4", "B+", "78"),
+        ("Software Engineering", "3", "A", "84"),
+    ]
+    y += 65
+    for subject, credits, grade, marks in rows:
+        _text(d, (80, y), subject, FONT, 24)
+        _text(d, (800, y), credits, FONT, 24)
+        _text(d, (1050, y), grade, FONT, 24)
+        _text(d, (1300, y), marks, FONT_MONO, 24)
+        y += 55
+    d.line((80, y + 10, 1574, y + 10), fill=(0, 0, 0), width=2)
+
+    y += 45
+    _text(d, (80, y), "CGPA: 8.72", FONT_BOLD, 30)
+    _text(d, (700, y), "Total Marks: 826", FONT_BOLD, 30)
+    _text(d, (1200, y), "Percentage: 82.6", FONT_BOLD, 28)
+    _text(d, (80, y + 70), "Qualification Awarded: Bachelor of Engineering", FONT, 26)
+    _text(d, (80, y + 140), "Registrar queries: 9812345670", FONT, 24)
+    _text(d, (80, y + 190), "This is a computer generated marksheet.", FONT, 22)
+    img.save(out)
+    return out
+
+
 def main() -> None:
     out_dir = Path(__file__).resolve().parent
     for fn, name in ((make_bank_statement, "bank_statement.png"),
                      (make_pan_card, "pan_card.png"),
-                     (make_salary_slip, "salary_slip.png")):
+                     (make_salary_slip, "salary_slip.png"),
+                     (make_voter_id_card, "voter_id_card.png"),
+                     (make_marksheet, "marksheet.png")):
         path = out_dir / name
         fn(path)
         print(f"Wrote {path}")

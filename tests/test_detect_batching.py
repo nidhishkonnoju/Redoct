@@ -20,7 +20,7 @@ def _words(n, poison_at=None):
 
 
 def _labeller(batch_size_seen):
-    def fake_detect(batch):
+    def fake_detect(batch, document_type=None):
         batch_size_seen.append(len(batch))
         return [{"id": w.id, "type": "other"} for w in batch]
     return fake_detect
@@ -40,7 +40,7 @@ class TestDetectBatching(unittest.TestCase):
         words = _words(12, poison_at=3)
         seen: list[int] = []
 
-        def flaky(batch):
+        def flaky(batch, document_type=None):
             seen.append(len(batch))
             if any(w.text == "POISON" for w in batch):
                 raise OllamaParseError("truncated JSON")

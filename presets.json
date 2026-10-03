@@ -1,7 +1,8 @@
 {
   "proof_of_income": {
     "label": "Proof of Income",
-    "keep_types": ["name", "salary_amount", "employer_name", "designation", "label_text", "remarks"],
+    "keep_types": ["name", "salary_amount", "employer_name", "designation", "label_text", "remarks",
+                   "transaction_date"],
     "redact_types": ["account_number", "ifsc_code", "address", "phone_number", "email",
                       "aadhaar_number", "pan_number", "voter_id_number", "father_name",
                       "date_of_birth", "transaction_line", "pf_number",
@@ -10,15 +11,20 @@
   },
   "id_verification": {
     "label": "ID Verification Only",
-    "keep_types": ["name", "photo_marker", "label_text"],
-    "redact_types": ["aadhaar_number", "pan_number", "voter_id_number", "address",
+    "keep_types": ["name", "photo_marker", "label_text", "transaction_date"],
+    "partial_types": {
+      "aadhaar_number": {"reveal": "last4", "format": "XXXX XXXX {last4}"},
+      "pan_number": {"reveal": "last4", "format": "XXXXXX{last4}"},
+      "voter_id_number": {"reveal": "last4", "format": "XXXXXXX{last4}"}
+    },
+    "redact_types": ["address",
                       "date_of_birth", "father_name", "phone_number", "email",
                       "signature_marker", "account_number", "salary_amount", "other"],
     "purpose_critical_types": ["name", "photo_marker"]
   },
   "proof_of_address": {
     "label": "Proof of Address",
-    "keep_types": ["name", "address", "label_text"],
+    "keep_types": ["name", "address", "label_text", "transaction_date"],
     "redact_types": ["aadhaar_number", "pan_number", "voter_id_number", "phone_number",
                       "email", "photo_marker", "date_of_birth", "father_name",
                       "signature_marker", "account_number", "salary_amount", "other"],
@@ -26,7 +32,8 @@
   },
   "education_proof": {
     "label": "Education Proof",
-    "keep_types": ["name", "institution_name", "qualification", "cgpa_or_marks", "label_text"],
+    "keep_types": ["name", "institution_name", "qualification", "cgpa_or_marks", "label_text",
+                   "transaction_date"],
     "redact_types": ["roll_number", "category", "father_name", "date_of_birth", "address",
                       "photo_marker", "aadhaar_number", "phone_number", "other"],
     "purpose_critical_types": ["name", "institution_name", "qualification"]

@@ -22,9 +22,13 @@ class TestPolicyLookup(unittest.TestCase):
         for pkey, preset in self.presets.items():
             frags = [{"id": f"t{i}", "type": t} for i, t in enumerate(FIELD_TYPES)]
             out = apply_policy(frags, preset)
-            assigned = set(out["redact_ids"]) | set(out["keep_ids"])
+            buckets = [out["redact_ids"], out["keep_ids"], out["partial_ids"]]
+            assigned = set().union(*buckets)
             self.assertEqual(assigned, {f["id"] for f in frags}, pkey)
-            self.assertFalse(set(out["redact_ids"]) & set(out["keep_ids"]), pkey)
+            # ...and exactly one decision each (keep / partial / redact).
+            for i in range(len(buckets)):
+                for j in range(i + 1, len(buckets)):
+                    self.assertFalse(set(buckets[i]) & set(buckets[j]), pkey)
 
     def test_unknown_type_redacts_everywhere(self):
         for preset in self.presets.values():
