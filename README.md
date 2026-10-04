@@ -1,11 +1,33 @@
-# Purpose-Based Document Redaction (Round 1 Prototype)
+# ReDoct — Purpose-Based Document Redaction (Round 1 Prototype)
 
-Local, private, purpose-based document redaction: pick **why** you're sharing
-a document (Proof of Income, ID Verification Only, …) and the app decides
-what stays visible and blacks out the rest.
+You're asked to prove one thing — and end up sharing everything. ReDoct
+breaks that trade: choose why you're sharing a document (Proof of Income,
+ID Verification Only, …) and it keeps exactly what that purpose needs
+visible, blacking out the rest.
 
 **Nothing leaves this machine** — Tesseract OCR + a local LLM served by
 Ollama. No cloud, no API keys, no telemetry.
+
+## Capabilities
+
+- **Pipeline stages** — classify → detect → anchors → policy lookup → regex
+  net → audit (numbered diagram below). The model only ever says *what* a
+  fragment is; visibility is a `presets.json` lookup.
+- **Four purpose presets, as implemented** — Proof of Income, ID Verification
+  Only, Proof of Address, Education Proof. Each declares keep / partial /
+  redact types plus the purpose-critical fields an audit can never re-hide.
+- **Partial masking (actual current format)** — `id_verification` reveals
+  exactly the last four characters of an Aadhaar / PAN / voter id behind an
+  opaque black box: `XXXX XXXX 9012`, `XXXXXX234F`, `XXXXXXX4567` — one
+  generic last-4 window per preset template (see Known Limitations for what
+  this is *not*).
+- **Purpose-switch caching** — Classify + Detect are cached per normalized
+  image, so the same document under a second purpose skips both calls;
+  measured live: 18.4 s cold → 8.4 s (0 LLM calls for those layers; the
+  audit still runs).
+- **Fail-closed by default** — unlabelled or unknown-type fragments redact,
+  any PII pattern beats any keep, and a mask that cannot be honoured falls
+  back to a full black box.
 
 ## Pipeline (Plan v2 — layered, Redacto-baseline architecture)
 
@@ -33,7 +55,7 @@ Image -> [1] OCR                pytesseract, word-level boxes + stable ids
 Layers 1–2 are purpose-agnostic by design, so they are cached per normalized
 image (`redact.DETECT_CACHE`): re-running the *same* document under a different
 purpose redoes only the free policy lookup and the render. Measured on
-`voter_id_card.png`: 17.0 s cold, 7.9 s on the second purpose (Classify and
+`voter_id_card.png`: 18.4 s cold, 8.4 s on the second purpose (Classify and
 Detect skipped entirely — the audit still runs).
 
 Why the split: a single LLM call was doing *classify + detect + decide
@@ -118,35 +140,35 @@ pip install -r requirements.txt
 Model choice (`config.py`): `llama3.2:3b` is the benchmarked default — 100% GPU
 on a 4 GB card. The layered pipeline makes at most 6 LLM calls per document (Classify +
 Detect + up to 2 audit rounds + the detect batch splits); the numbers below
-come from `python e2e_acceptance.py --timings`, warm, `num_ctx=4096`:
+come from `python e2e_acceptance.py --timings` (single live run), `num_ctx=4096`:
 
 | Layer | Sample timings | Notes |
 |---|---|---|
-| Classify | 2.6–4.8 s | output is one word |
-| Detect | 3–13 s per call (batched, ≤40 fragments/call) | 1–4 calls: the dominant cost |
-| LLM audit | 3–5 s per round (≤2 rounds) | stops early when nothing is flagged |
+| Classify | 2.8–3.8 s warm (12 s first cold call) | output is one word |
+| Detect | 4.6–11.8 s per batch call (≤40 fragments/call) | 1–3 calls: the dominant cost |
+| LLM audit | 2.9–7.0 s per round (≤2 rounds) | stops early when nothing is flagged |
 | OCR + anchors + policy + render | < 1 s | no model involved |
 
-Re-measured after Plan v3 (six real document/purpose pairs, warm, from
-`python e2e_acceptance.py --timings`):
+Re-measured from a fresh live run of `python e2e_acceptance.py --timings` (six
+document/purpose pairs, one pass):
 
 | Case | Total | Classify | Detect | Audit | OCR + render |
 |---|---|---|---|---|---|
-| `pan_card` + ID Verification | 14.5 s | 2.7 s | 7.8 s | 3.6 s | 0.4 s |
-| `voter_id_card` + ID Verification | 17.0 s | 2.9 s | 9.8 s | 3.9 s | 0.3 s |
-| `bank_statement` + Proof of Income | 28.8 s | 3.7 s | 21.4 s | 2.8 s | 0.8 s |
-| `salary_slip` + Proof of Income | 26.6 s | 3.4 s | 15.1 s | 7.6 s | 0.5 s |
-| `marksheet` + Education Proof | 48.0 s | 3.4 s | 38.2 s | 5.8 s | 0.6 s |
-| `voter_id_card` + Proof of Address (2nd purpose, cached) | 7.9 s | cached | cached | 7.5 s | 0.4 s |
+| `pan_card` + ID Verification | 16.1 s | 2.8 s | 8.3 s | 4.6 s | 0.4 s |
+| `voter_id_card` + ID Verification | 18.4 s | 2.9 s | 10.1 s | 5.0 s | 0.4 s |
+| `bank_statement` + Proof of Income | 49.7 s | 12.0 s (cold load) | 29.3 s | 7.0 s | 1.5 s |
+| `salary_slip` + Proof of Income | 38.3 s | 3.4 s | 24.1 s | 10.3 s | 0.6 s |
+| `marksheet` + Education Proof | 60.0 s | 3.2 s | 44.8 s | 11.3 s | 0.7 s |
+| `voter_id_card` + Proof of Address (2nd purpose, cached) | 8.4 s | cached | cached | 7.9 s | 0.5 s |
 
-Detect dominates (55–80% of LLM time) and Classify is a single ~3 s call,
+Detect dominates (53–76% of LLM time) and Classify is a single ~3 s call,
 so merging Classify into Detect's first batch would save ~1 call on a *cold*
 run at the cost of one combined prompt and a worse failure mode (a
 mis-classified document type would take the labels down with it). Measured
 first, kept separate — and the Detect cache already removes Classify from
 the hot re-run path.
 
-End-to-end: **~14 s (ID card) to ~48 s (dense marksheet) cold; ~8 s for a
+End-to-end: **~16 s (ID card) to ~60 s (dense marksheet) cold; ~8.4 s for a
 second purpose on the same document**. Override the
 model without code changes:
 
@@ -203,15 +225,15 @@ or capture from the webcam.
    go black. Then `sample_docs/marksheet.png` with **Education Proof**:
    institution, programme and `CGPA: 8.72` stay visible while the roll
    number, category, father's name, DOB and the registrar's phone go black.
-   (~20 s each, and switching purpose on the same document is fast because
-   Classify + Detect are cached.)
+   (~16–60 s each — see the latency table — switching purpose on the same
+   document is fast because Classify + Detect are cached.)
 
 ## Known limitations (by design for Round 1)
 
 - Photo/signature regions are not detected (OCR-only pipeline) — next step.
 - Four fixed presets; custom purposes are a `presets.json` edit away.
 - Single image per run; no multi-page PDF.
-- Latency ~22–60 s per document on a GTX 1650 laptop (warm; first call loads
+- Latency ~16–60 s per document on a GTX 1650 laptop (first call loads
   the model) for up to 6 LLM calls cold; a second purpose on the same
   document skips Classify + Detect (cached) and lands near the audit cost
   alone. Layer timings are printed by `python redact.py` and, per case, by
@@ -228,7 +250,22 @@ or capture from the webcam.
   boxes (merged columns) can keep a counterparty name visible; the audit layer
   is the backstop there, and the row is still redacted whenever the amount
   shares the row.
-
+- **Same literal text in two roles resolves as one decision.** If a string
+  shows up both as the subject's name and inside the father's-name line (a
+  shared surname), Detect tends to give both fragments the same label and
+  nothing re-decides them independently by position: the third-party anchor
+  corrects the relative's copy when the model called it `name`, but in the
+  other direction (both called `father_name`) the subject's own copy is
+  redacted along with it. No code path or test covers this yet — open bug,
+  not fixed.
+- **Partial masking is one generic last-4 rule, not a compliance spec.** All
+  three partial types reveal their final four characters behind X-padding
+  (Aadhaar `XXXX XXXX 9012`, PAN `XXXXXX234F`, voter id `XXXXXXX4567`).
+  That display matches the usual masked-Aadhaar form for Aadhaar, but nothing
+  applies per-identifier legal formats: PAN's CKYC-style reveal (first 5 +
+  last 1, middle 4 masked), per-type Voter ID formatting, and the QR-code
+  preserve-vs-mask decision per document type are **not implemented** —
+  `mask_value()` places a single reveal window only. Deferred, see Roadmap.
 - Native Android/NPU port (LiteRT-LM + Gemma) is the on-site build — see
   *Porting to Android* below.
 
@@ -260,6 +297,16 @@ than the pipeline's own word:
 6/6 cases -> `PII visible=none`, with the names and figures those purposes
 exist to prove still legible, and the two identifiers revealed exactly as
 their preset declares.
+
+## Roadmap (identified, not scoped yet)
+
+- **Compliance masking per identifier** — replace the generic last-4 reveal
+  with the legally specified formats per document type: Aadhaar (mask the
+  first 8, show the last 4), PAN (show the first 5 + last 1, mask the middle
+  4), Voter ID per its own format, plus a preserve-vs-mask decision for the
+  printed QR / barcode on each document type. Identified as a real
+  requirement during planning but never scoped into Plan v2/v3 —
+  intentionally deferred, not forgotten.
 
 ## Porting to Android (Plan v3 Priority 6 — scoping, not built yet)
 
